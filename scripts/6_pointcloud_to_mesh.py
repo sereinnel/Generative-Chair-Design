@@ -1,6 +1,6 @@
 # 6_pointcloud_to_mesh.py
 """
-Конвертация облаков точек (.ply / .npy) -> watertight .obj с помощью Open3D (Poisson reconstruction).
+Конвертация облаков точек (.ply / .npy) -> polygonal .obj с помощью Open3D (Poisson reconstruction).
 Скрипт:
  - читает все .ply/.npy из input_dir
  - очищает шум (statistical outlier removal)
@@ -21,35 +21,36 @@ import traceback
 SUPPORTED_IN = (".ply", ".pcd", ".xyz", ".npy")
 
 def load_pointcloud(path):
-    ext = os.path.splitext(path)[1].lower()
-    if ext == ".npy":
-        pts = np.load(path).astype(np.float32)
-        pcd = o3d.geometry.PointCloud()
-                # --- PREPROCESS POINT CLOUD ---
+    """Load a point cloud from a supported file format."""
+    extension = os.path.splitext(path)[1].lower()
 
-        # 1. Лёгкое voxel downsample (стабилизирует плотность)
-        pcd = pcd.voxel_down_sample(voxel_size=0.005)
-
-        # 2. Удаление статистических выбросов
-        pcd, _ = pcd.remove_statistical_outlier(
-            nb_neighbors=30,
-            std_ratio=1.5
+    if extension not in SUPPORTED_IN:
+        raise ValueError(
+            f"Unsupported point-cloud format: {extension}"
         )
 
-        # 3. Пересчёт нормалей (ВАЖНО для Poisson)
-        pcd.estimate_normals(
-            search_param=o3d.geometry.KDTreeSearchParamHybrid(
-                radius=0.02,
-                max_nn=30
+    if extension == ".npy":
+        points = np.load(path).astype(np.float64)
+
+        if points.ndim != 2 or points.shape[1] != 3:
+            raise ValueError(
+                f"Expected array with shape (N, 3), got {points.shape}"
             )
-        )
-        pcd.normalize_normals()
 
-        pcd.points = o3d.utility.Vector3dVector(pts)
-        return pcd
+        if not np.isfinite(points).all():
+            raise ValueError(
+                f"Point cloud contains NaN or infinite values: {path}"
+            )
+
+        point_cloud = o3d.geometry.PointCloud()
+        point_cloud.points = o3d.utility.Vector3dVector(points)
     else:
-        pcd = o3d.io.read_point_cloud(path)
-        return pcd
+        point_cloud = o3d.io.read_point_cloud(path)
+
+    if point_cloud.is_empty():
+        raise ValueError(f"Empty point cloud: {path}")
+
+    return point_cloud
 
 def clean_and_estimate_normals(pcd, nb_neighbors=50, std_ratio=1.0, knn_normals=30):
     # remove statistical outliers
