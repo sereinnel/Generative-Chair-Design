@@ -13,24 +13,20 @@ from torch.cuda.amp import autocast, GradScaler
 
 from model_improved import PointNetVAE
 
-# -----------------------
-# Конфигурация по умолчанию
-# -----------------------
 class Cfg:
-    DATA_DIR = "../data/normalized_npy"   # относительный к scripts/
+    DATA_DIR = "../data/normalized_npy"
     TRAIN_SUBDIR = "train"
     TEST_SUBDIR = "test"
 
-    # Точки: данные храним 16384, но для обучения достаточно N_TRAIN (подвыборка)
     RAW_POINTS = 16384
-    TRAIN_POINTS = 4096     # количество точек, подаваемых в сеть при обучении (сэмплируется)
-    LOSS_POINTS = 4096      # количество точек для расчета Chamfer (может равняться TRAIN_POINTS)
+    TRAIN_POINTS = 4096
+    LOSS_POINTS = 4096
 
     BATCH_SIZE = 8
     LR = 1e-4
     WEIGHT_DECAY = 1e-5
     LATENT_DIM = 256
-    EPOCHS = 150
+    EPOCHS = 25
     MODEL_SAVE_DIR = "../models"
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
     NUM_WORKERS = 4
@@ -44,7 +40,7 @@ class Cfg:
 class PointCloudDataset(Dataset):
     def __init__(self, folder, num_points=Cfg.TRAIN_POINTS):
         self.folder = folder
-        self.files = [p for p in os.listdir(folder) if p.endswith('.npy')]
+        self.files = sorted(p for p in os.listdir(folder) if p.endswith(".npy"))
         self.num_points = num_points
 
     def __len__(self):
