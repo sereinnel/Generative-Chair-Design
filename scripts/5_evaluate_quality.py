@@ -1,190 +1,330 @@
-#4_generate_chairs.py
-import os
+"""Evaluate generated point clouds with symmetric Chamfer-L2 distance."""
+
+from __future__ import annotations
+
 import argparse
-import numpy as np
-from scipy.spatial import cKDTree
-import open3d as o3d
-from tqdm import tqdm
 import csv
-import itertools
-import math
+import json
+import logging
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable
 
-def load_pointcloud_auto(path):
-    """
-    Загружает облако из .ply или .npy и возвращает numpy array shape (N,3), dtype=float32.
-    """
-    path = str(path)
-    ext = os.path.splitext(path)[1].lower()
-    if ext == ".ply" or ext == ".pcd" or ext == ".xyz":
-        pcd = o3d.io.read_point_cloud(path)
-        pts = np.asarray(pcd.points, dtype=np.float32)
-        return pts
-    elif ext == ".npy":
-        pts = np.load(path).astype(np.float32)
-        return pts
+import numpy as np
+import open3d as o3d
+from scipy.spatial import cKDTree
+from tqdm import tqdm
+
+LOGGER = logging.getLogger(__name__)
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+SUPPORTED_EXTENSIONS = (".npy", ".ply", ".pcd", ".xyz")
+
+
+@dataclass(frozen=True)
+class PointCloudRecord:
+    """A sampled point cloud and its nearest-neighbor index."""
+
+    name: str
+    path: Path
+    points: np.ndarray
+    tree: cKDTree
+
+
+def load_point_cloud(path: Path) -> np.ndarray:
+    """Load a point cloud as a finite float32 array with shape ``(N, 3)``."""
+    if path.suffix.lower() == ".npy":
+        points = np.load(path).astype(np.float32, copy=False)
     else:
-        raise ValueError(f"Unsupported file extension: {ext} for file {path}")
+        point_cloud = o3d.io.read_point_cloud(str(path))
+        points = np.asarray(point_cloud.points, dtype=np.float32)
 
-def sample_points(points, num_points):
-    """
-    Если points.shape[0] >= num_points — случайная подвыборка без замены.
-    Иначе — повтор с replacement.
-    Возвращает (num_points, 3) np.float32.
-    """
-    n = points.shape[0]
-    if n == num_points:
-        return points.copy().astype(np.float32)
-    if n > num_points:
-        idx = np.random.choice(n, num_points, replace=False)
-    else:
-        idx = np.random.choice(n, num_points, replace=True)
-    return points[idx].astype(np.float32)
+    if points.ndim != 2 or points.shape[1] != 3:
+        raise ValueError(f"{path} has shape {points.shape}; expected (N, 3)")
+    if len(points) == 0:
+        raise ValueError(f"{path} contains no points")
+    if not np.isfinite(points).all():
+        raise ValueError(f"{path} contains NaN or infinite values")
 
-def chamfer_distance_np(a, b):
-    """
-    Chamfer distance between two point clouds a and b (np arrays shape (N,3) and (M,3)).
-    Returns scalar = mean_{p in a} min_{q in b} ||p-q||^2 + mean_{q in b} min_{p in a} ||q-p||^2
-    Note: returns the mean of squared distances (L2^2). We also return sqrt-mean if requested later.
-    """
-    # tree from b to query a
-    tree_b = cKDTree(b)
-    dists_ab, _ = tree_b.query(a, k=1)
-    tree_a = cKDTree(a)
-    dists_ba, _ = tree_a.query(b, k=1)
-    # use squared distances or raw? We'll return mean of squared distances for consistency with many CD implementations.
-    # Here dists are Euclidean distances; square them to get L2^2 if you want. We'll return mean(dists) (L2) and mean(dists**2).
-    mean_l2 = 0.5 * (np.mean(dists_ab) + np.mean(dists_ba))
-    mean_l2sq = 0.5 * (np.mean(dists_ab**2) + np.mean(dists_ba**2))
-    return {"cd_l2": mean_l2, "cd_l2sq": mean_l2sq}
+    return points
 
-def evaluate_generated_vs_test(generated_paths, test_paths, num_points=4096, out_csv=None):
-    """
-    Для каждого сгенерированного файла находит минимальный Chamfer к тестовым.
-    Возвращает summary dict и (optionally) пишет CSV with per-generated-file info.
-    """
-    # Preload & sample test clouds (to speed repeated queries)
-    print(f"Loading and sampling {len(test_paths)} test clouds...")
-    test_clouds = []
-    for tp in tqdm(test_paths, desc="loading test"):
-        pts = load_pointcloud_auto(tp)
-        pts = sample_points(pts, num_points)
-        test_clouds.append( (os.path.basename(tp), pts) )
 
-    results = []
-    # For speed, build cKDTree for each test cloud once
-    test_trees = [cKDTree(pts) for _, pts in test_clouds]
+def sample_points(
+    points: np.ndarray,
+    num_points: int,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """Sample a fixed number of points, with replacement when necessary."""
+    replace = len(points) < num_points
+    indices = rng.choice(len(points), size=num_points, replace=replace)
+    return points[indices].astype(np.float32, copy=False)
 
-    print(f"Evaluating {len(generated_paths)} generated clouds against {len(test_paths)} test clouds...")
-    for gen_path in tqdm(generated_paths, desc="generated"):
-        gen_name = os.path.basename(gen_path)
-        try:
-            gen_pts = load_pointcloud_auto(gen_path)
-        except Exception as e:
-            print(f"Skipping {gen_path}, load error: {e}")
+
+def symmetric_chamfer_l2(
+    first: np.ndarray,
+    second: np.ndarray,
+    first_tree: cKDTree | None = None,
+    second_tree: cKDTree | None = None,
+) -> float:
+    """Average the two directed mean nearest-neighbor Euclidean distances."""
+    first_index = first_tree if first_tree is not None else cKDTree(first)
+    second_index = second_tree if second_tree is not None else cKDTree(second)
+
+    first_to_second = second_index.query(first, k=1)[0].mean()
+    second_to_first = first_index.query(second, k=1)[0].mean()
+    return 0.5 * float(first_to_second + second_to_first)
+
+
+def find_point_cloud_files(directory: Path) -> list[Path]:
+    """Return one file per stem, preferring NPY when several formats exist."""
+    if not directory.is_dir():
+        raise FileNotFoundError(f"directory not found: {directory}")
+
+    by_stem: dict[str, Path] = {}
+    extension_priority = {".npy": 0, ".ply": 1, ".pcd": 2, ".xyz": 3}
+
+    for path in sorted(directory.iterdir()):
+        suffix = path.suffix.lower()
+        if suffix not in SUPPORTED_EXTENSIONS:
             continue
-        gen_pts = sample_points(gen_pts, num_points)
 
-        # compute CD to each test cloud (we'll compute symmetric CD approx via two queries)
-        best_cd = float("inf")
-        best_test = None
+        current = by_stem.get(path.stem)
+        if current is None or extension_priority[suffix] < extension_priority[
+            current.suffix.lower()
+        ]:
+            by_stem[path.stem] = path
 
-        # To reduce repeated work, we compute distances from gen to test (gen->test) and test->gen separately:
-        # For each test tree, query nearest distances from gen points (g->t)
-        for (tname, tpts), ttree in zip(test_clouds, test_trees):
-            d_gen_to_test, _ = ttree.query(gen_pts, k=1)  # distances array len=num_points
-            # for test->gen we need tree on gen
-            # compute only if candidate is promising? simple approach compute both
-            tree_gen = cKDTree(gen_pts)
-            d_test_to_gen, _ = tree_gen.query(tpts, k=1)
-            cd_l2 = 0.5 * (np.mean(d_gen_to_test) + np.mean(d_test_to_gen))
-            # cd_l2sq optional
-            if cd_l2 < best_cd:
-                best_cd = cd_l2
-                best_test = tname
+    return sorted(by_stem.values())
 
-        results.append({
-            "gen_file": gen_name,
-            "gen_path": gen_path,
-            "best_test": best_test,
-            "best_cd_l2": best_cd
-        })
 
-    # Compute summary stats on best_cd across generated set
-    cds = np.array([r["best_cd_l2"] for r in results], dtype=np.float32)
-    summary = {
-        "n_generated": len(results),
-        "mean_best_cd": float(np.mean(cds)) if len(cds)>0 else None,
-        "median_best_cd": float(np.median(cds)) if len(cds)>0 else None,
-        "std_best_cd": float(np.std(cds)) if len(cds)>0 else None,
-        "min_best_cd": float(np.min(cds)) if len(cds)>0 else None,
-        "max_best_cd": float(np.max(cds)) if len(cds)>0 else None
+def load_records(
+    paths: Iterable[Path],
+    num_points: int,
+    rng: np.random.Generator,
+    label: str,
+) -> list[PointCloudRecord]:
+    """Load, sample and index a collection of point clouds."""
+    records: list[PointCloudRecord] = []
+
+    for path in tqdm(list(paths), desc=f"Loading {label}"):
+        try:
+            points = sample_points(load_point_cloud(path), num_points, rng)
+        except (OSError, RuntimeError, ValueError) as error:
+            LOGGER.warning("Skipping %s: %s", path.name, error)
+            continue
+
+        records.append(
+            PointCloudRecord(
+                name=path.name,
+                path=path,
+                points=points,
+                tree=cKDTree(points),
+            )
+        )
+
+    return records
+
+
+def nearest_reference_results(
+    generated: list[PointCloudRecord],
+    references: list[PointCloudRecord],
+) -> list[dict[str, object]]:
+    """Find the closest reference cloud for every generated sample."""
+    results: list[dict[str, object]] = []
+
+    for sample in tqdm(generated, desc="Nearest-reference evaluation"):
+        best_reference: PointCloudRecord | None = None
+        best_distance = float("inf")
+
+        for reference in references:
+            distance = symmetric_chamfer_l2(
+                sample.points,
+                reference.points,
+                sample.tree,
+                reference.tree,
+            )
+            if distance < best_distance:
+                best_distance = distance
+                best_reference = reference
+
+        if best_reference is None:
+            raise RuntimeError("reference set is empty")
+
+        results.append(
+            {
+                "generated_file": sample.name,
+                "generated_path": str(sample.path),
+                "nearest_reference": best_reference.name,
+                "chamfer_l2": best_distance,
+            }
+        )
+
+    return results
+
+
+def pairwise_diversity(records: list[PointCloudRecord]) -> list[float]:
+    """Compute upper-triangular pairwise Chamfer-L2 distances."""
+    values: list[float] = []
+
+    for first_index in tqdm(range(len(records)), desc="Pairwise diversity"):
+        first = records[first_index]
+        for second in records[first_index + 1 :]:
+            values.append(
+                symmetric_chamfer_l2(
+                    first.points,
+                    second.points,
+                    first.tree,
+                    second.tree,
+                )
+            )
+
+    return values
+
+
+def summarize(
+    nearest_results: list[dict[str, object]],
+    pairwise_values: list[float],
+) -> dict[str, float | int | None]:
+    """Aggregate evaluation metrics."""
+    nearest = np.asarray(
+        [result["chamfer_l2"] for result in nearest_results],
+        dtype=np.float64,
+    )
+    pairwise = np.asarray(pairwise_values, dtype=np.float64)
+
+    return {
+        "num_generated": int(len(nearest_results)),
+        "mean_nearest_reference_chamfer_l2": (
+            float(nearest.mean()) if len(nearest) else None
+        ),
+        "median_nearest_reference_chamfer_l2": (
+            float(np.median(nearest)) if len(nearest) else None
+        ),
+        "std_nearest_reference_chamfer_l2": (
+            float(nearest.std()) if len(nearest) else None
+        ),
+        "min_nearest_reference_chamfer_l2": (
+            float(nearest.min()) if len(nearest) else None
+        ),
+        "max_nearest_reference_chamfer_l2": (
+            float(nearest.max()) if len(nearest) else None
+        ),
+        "mean_pairwise_chamfer_l2": (
+            float(pairwise.mean()) if len(pairwise) else None
+        ),
+        "median_pairwise_chamfer_l2": (
+            float(np.median(pairwise)) if len(pairwise) else None
+        ),
+        "std_pairwise_chamfer_l2": (
+            float(pairwise.std()) if len(pairwise) else None
+        ),
     }
 
-    # Pairwise diversity among generated clouds (mean pairwise CD)
-    print("Computing pairwise diversity (pairwise Chamfer among generated samples)...")
-    pairwise = []
-    G = len(results)
-    # Pre-load sampled generated clouds for pairwise
-    gen_sampled = []
-    for r in results:
-        pts = load_pointcloud_auto(r["gen_path"])
-        pts = sample_points(pts, num_points)
-        gen_sampled.append(pts)
-    # compute upper-triangle
-    for i in tqdm(range(G), desc="pairwise"):
-        for j in range(i+1, G):
-            cd = chamfer_distance_np(gen_sampled[i], gen_sampled[j])["cd_l2"]
-            pairwise.append(cd)
-    if len(pairwise) > 0:
-        summary["pairwise_mean_cd"] = float(np.mean(pairwise))
-        summary["pairwise_median_cd"] = float(np.median(pairwise))
-        summary["pairwise_std_cd"] = float(np.std(pairwise))
-    else:
-        summary["pairwise_mean_cd"] = None
 
-    # Save CSV
-    if out_csv:
-        os.makedirs(os.path.dirname(out_csv), exist_ok=True)
-        with open(out_csv, "w", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            writer.writerow(["gen_file","gen_path","best_test","best_cd_l2"])
-            for r in results:
-                writer.writerow([r["gen_file"], r["gen_path"], r["best_test"], f"{r['best_cd_l2']:.6f}"])
-        print(f"Wrote results to {out_csv}")
+def write_csv(path: Path, results: list[dict[str, object]]) -> None:
+    """Write per-sample nearest-reference results."""
+    path.parent.mkdir(parents=True, exist_ok=True)
 
-    return summary, results
+    with path.open("w", newline="", encoding="utf-8") as file:
+        writer = csv.DictWriter(
+            file,
+            fieldnames=(
+                "generated_file",
+                "generated_path",
+                "nearest_reference",
+                "chamfer_l2",
+            ),
+        )
+        writer.writeheader()
+        for result in results:
+            writer.writerow(
+                {
+                    **result,
+                    "chamfer_l2": f"{float(result['chamfer_l2']):.8f}",
+                }
+            )
 
-def find_files(dir_path, exts=(".ply", ".npy")):
-    files = []
-    for fn in os.listdir(dir_path):
-        if fn.lower().endswith(exts):
-            files.append(os.path.join(dir_path, fn))
-    files.sort()
-    return files
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--generated-dir",
+        type=Path,
+        default=PROJECT_ROOT / "results" / "generated",
+    )
+    parser.add_argument(
+        "--reference-dir",
+        type=Path,
+        default=PROJECT_ROOT / "data" / "normalized_npy" / "test",
+        help="Held-out split used as validation data in the original experiment.",
+    )
+    parser.add_argument("--num-points", type=int, default=4096)
+    parser.add_argument(
+        "--out-csv",
+        type=Path,
+        default=PROJECT_ROOT / "results" / "evaluation.csv",
+    )
+    parser.add_argument(
+        "--summary-json",
+        type=Path,
+        default=PROJECT_ROOT / "results" / "evaluation_summary.json",
+    )
+    parser.add_argument("--seed", type=int, default=42)
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+
+    if args.num_points <= 0:
+        raise SystemExit("--num-points must be positive")
+
+    generated_paths = find_point_cloud_files(args.generated_dir)
+    reference_paths = find_point_cloud_files(args.reference_dir)
+
+    if not generated_paths:
+        raise SystemExit(f"No generated point clouds found in {args.generated_dir}")
+    if not reference_paths:
+        raise SystemExit(f"No reference point clouds found in {args.reference_dir}")
+
+    rng = np.random.default_rng(args.seed)
+    generated = load_records(
+        generated_paths,
+        args.num_points,
+        rng,
+        "generated clouds",
+    )
+    references = load_records(
+        reference_paths,
+        args.num_points,
+        rng,
+        "reference clouds",
+    )
+
+    if not generated or not references:
+        raise SystemExit("Evaluation requires at least one valid generated and reference cloud.")
+
+    nearest_results = nearest_reference_results(generated, references)
+    pairwise_values = pairwise_diversity(generated)
+    summary = summarize(nearest_results, pairwise_values)
+
+    write_csv(args.out_csv, nearest_results)
+    args.summary_json.parent.mkdir(parents=True, exist_ok=True)
+    args.summary_json.write_text(
+        json.dumps(summary, indent=2),
+        encoding="utf-8",
+    )
+
+    LOGGER.info("Evaluation summary")
+    for name, value in summary.items():
+        if isinstance(value, float):
+            LOGGER.info("%s: %.8f", name, value)
+        else:
+            LOGGER.info("%s: %s", name, value)
+
+    LOGGER.info("Per-sample results: %s", args.out_csv)
+    LOGGER.info("Summary: %s", args.summary_json)
+
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Evaluate generated pointclouds vs test set using Chamfer Distance")
-    parser.add_argument("--generated_dir", type=str, default="results/visualization/21", help="folder with generated .ply or .npy")
-    parser.add_argument("--test_dir", type=str, default="data/normalized_npy/test", help="folder with test .npy pointclouds")
-    parser.add_argument("--num_points", type=int, default=4096, help="number of points to sample for comparison")
-    parser.add_argument("--out_csv", type=str, default="results/visualization/21/eval_generated_vs_test.csv", help="where to save csv")
-    args = parser.parse_args()
-
-    if not os.path.exists(args.generated_dir):
-        raise SystemExit(f"Generated dir not found: {args.generated_dir}")
-    if not os.path.exists(args.test_dir):
-        raise SystemExit(f"Test dir not found: {args.test_dir}")
-
-    gen_files = find_files(args.generated_dir, exts=(".ply",".npy"))
-    test_files = find_files(args.test_dir, exts=(".npy",))
-
-    if len(gen_files) == 0:
-        raise SystemExit("No generated files found in generated_dir.")
-
-    print("Found generated:", len(gen_files), "files. Found test:", len(test_files), "files.")
-    summary, results = evaluate_generated_vs_test(gen_files, test_files, num_points=args.num_points, out_csv=args.out_csv)
-
-    print("\n=== SUMMARY ===")
-    for k,v in summary.items():
-        print(f"{k}: {v}")
-    print("\nPer-file results saved to:", args.out_csv)
+    main()

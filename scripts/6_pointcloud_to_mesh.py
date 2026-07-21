@@ -1,231 +1,326 @@
-# 6_pointcloud_to_mesh.py
-"""
-Конвертация облаков точек (.ply / .npy) -> polygonal .obj с помощью Open3D (Poisson reconstruction).
-Скрипт:
- - читает все .ply/.npy из input_dir
- - очищает шум (statistical outlier removal)
- - оценивает и ориентирует нормали
- - Poisson reconstruction -> mesh + densities
- - отбрасывает низкоплотные вершины по квантилю
- - опционально: fallback Ball Pivoting, упрощение mesh
- - сохраняет .obj и (по желанию) промежуточные .ply/.ply.cleaned
-"""
+"""Reconstruct polygonal meshes from generated point clouds."""
 
-import os
+from __future__ import annotations
+
 import argparse
+import logging
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Sequence
+
 import numpy as np
 import open3d as o3d
 from tqdm import tqdm
-import traceback
 
-SUPPORTED_IN = (".ply", ".pcd", ".xyz", ".npy")
+LOGGER = logging.getLogger(__name__)
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+SUPPORTED_EXTENSIONS = (".npy", ".ply", ".pcd", ".xyz")
 
-def load_pointcloud(path):
-    """Load a point cloud from a supported file format."""
-    extension = os.path.splitext(path)[1].lower()
 
-    if extension not in SUPPORTED_IN:
-        raise ValueError(
-            f"Unsupported point-cloud format: {extension}"
-        )
+@dataclass(frozen=True)
+class ReconstructionConfig:
+    """Parameters used by the surface-reconstruction pipeline."""
 
-    if extension == ".npy":
-        points = np.load(path).astype(np.float64)
+    poisson_depth: int = 10
+    density_quantile: float = 0.1
+    target_triangles: int | None = 15_000
+    outlier_neighbors: int = 50
+    outlier_std_ratio: float = 1.0
+    normal_neighbors: int = 30
+    max_points: int | None = 200_000
+    ball_pivoting_radii: tuple[float, ...] = (0.01, 0.02, 0.04)
+    keep_intermediate: bool = False
+
+
+def load_point_cloud(path: Path) -> o3d.geometry.PointCloud:
+    """Load a supported point-cloud file."""
+    if path.suffix.lower() not in SUPPORTED_EXTENSIONS:
+        raise ValueError(f"unsupported point-cloud format: {path.suffix}")
+
+    if path.suffix.lower() == ".npy":
+        points = np.load(path).astype(np.float64, copy=False)
 
         if points.ndim != 2 or points.shape[1] != 3:
-            raise ValueError(
-                f"Expected array with shape (N, 3), got {points.shape}"
-            )
-
+            raise ValueError(f"expected an array with shape (N, 3), got {points.shape}")
         if not np.isfinite(points).all():
-            raise ValueError(
-                f"Point cloud contains NaN or infinite values: {path}"
-            )
+            raise ValueError("point cloud contains NaN or infinite values")
 
         point_cloud = o3d.geometry.PointCloud()
         point_cloud.points = o3d.utility.Vector3dVector(points)
     else:
-        point_cloud = o3d.io.read_point_cloud(path)
+        point_cloud = o3d.io.read_point_cloud(str(path))
 
     if point_cloud.is_empty():
-        raise ValueError(f"Empty point cloud: {path}")
+        raise ValueError("point cloud is empty")
 
     return point_cloud
 
-def clean_and_estimate_normals(pcd, nb_neighbors=50, std_ratio=1.0, knn_normals=30):
-    # remove statistical outliers
-    try:
-        pcd, ind = pcd.remove_statistical_outlier(nb_neighbors=nb_neighbors, std_ratio=std_ratio)
-    except Exception:
-        # fallback: return original if removal fails
-        pass
 
-    # estimate normals
-    pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamKNN(knn=knn_normals))
-    # orient normals consistently (tangent plane)
-    try:
-        pcd.orient_normals_consistent_tangent_plane(k=knn_normals)
-    except Exception:
-        # if fails, try simpler orientation
-        try:
-            pcd.orient_normals_towards_camera_location(np.array([0., 0., 0.]))
-        except Exception:
-            pass
-    return pcd
+def preprocess_point_cloud(
+    point_cloud: o3d.geometry.PointCloud,
+    config: ReconstructionConfig,
+) -> o3d.geometry.PointCloud:
+    """Downsample, remove outliers and estimate consistently oriented normals."""
+    if config.max_points and len(point_cloud.points) > config.max_points:
+        ratio = config.max_points / len(point_cloud.points)
+        point_cloud = point_cloud.random_down_sample(ratio)
 
-def poisson_reconstruct(pcd, depth=10):
-    mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(pcd, depth=depth)
-    densities = np.asarray(densities)
-    return mesh, densities
-
-def filter_mesh_by_density(mesh, densities, keep_quantile=0.1):
-    # densities mapped to vertices
-    thr = np.quantile(densities, keep_quantile)
-    mask = densities < thr
     try:
-        mesh.remove_vertices_by_mask(mask)
-    except Exception:
-        # older Open3D versions require boolean mask of length == n_vertices
-        mesh.remove_vertices_by_mask(mask)
+        point_cloud, _ = point_cloud.remove_statistical_outlier(
+            nb_neighbors=config.outlier_neighbors,
+            std_ratio=config.outlier_std_ratio,
+        )
+    except RuntimeError as error:
+        LOGGER.warning("Outlier removal failed: %s", error)
+
+    if point_cloud.is_empty():
+        raise ValueError("point cloud became empty during preprocessing")
+
+    point_cloud.estimate_normals(
+        search_param=o3d.geometry.KDTreeSearchParamKNN(
+            knn=config.normal_neighbors
+        )
+    )
+
+    try:
+        point_cloud.orient_normals_consistent_tangent_plane(
+            k=config.normal_neighbors
+        )
+    except RuntimeError as error:
+        LOGGER.warning("Consistent normal orientation failed: %s", error)
+
+    return point_cloud
+
+
+def poisson_reconstruction(
+    point_cloud: o3d.geometry.PointCloud,
+    depth: int,
+) -> tuple[o3d.geometry.TriangleMesh, np.ndarray]:
+    """Run Poisson surface reconstruction."""
+    mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
+        point_cloud,
+        depth=depth,
+    )
+    return mesh, np.asarray(densities)
+
+
+def remove_low_density_vertices(
+    mesh: o3d.geometry.TriangleMesh,
+    densities: np.ndarray,
+    quantile: float,
+) -> o3d.geometry.TriangleMesh:
+    """Remove vertices below a selected Poisson-density quantile."""
+    if not 0.0 <= quantile < 1.0:
+        raise ValueError("density quantile must be in [0, 1)")
+    if len(densities) != len(mesh.vertices):
+        raise ValueError("density array does not match the number of mesh vertices")
+
+    threshold = float(np.quantile(densities, quantile))
+    mesh.remove_vertices_by_mask(densities < threshold)
+    mesh.remove_unreferenced_vertices()
     return mesh
 
-def simplify_mesh(mesh, target_triangles):
-    try:
-        mesh = mesh.simplify_quadric_decimation(target_number_of_triangles=int(target_triangles))
-        mesh.remove_unreferenced_vertices()
-        mesh.compute_vertex_normals()
-    except Exception:
-        pass
-    return mesh
 
-def ball_pivoting_reconstruct(pcd, radii=[0.01, 0.02, 0.04]):
-    # fallback mesh: Ball Pivoting (may produce non-watertight)
-    try:
-        pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamKNN(knn=30))
-        mesh = o3d.geometry.TriangleMesh.create_from_point_cloud_ball_pivoting(
-            pcd, o3d.utility.DoubleVector(radii))
-        mesh.compute_vertex_normals()
+def simplify_mesh(
+    mesh: o3d.geometry.TriangleMesh,
+    target_triangles: int | None,
+) -> o3d.geometry.TriangleMesh:
+    """Reduce triangle count when a positive target is provided."""
+    if target_triangles is None or len(mesh.triangles) <= target_triangles:
         return mesh
-    except Exception:
-        return None
 
-def process_file(path, out_dir, params):
-    basename = os.path.splitext(os.path.basename(path))[0]
+    simplified = mesh.simplify_quadric_decimation(
+        target_number_of_triangles=target_triangles
+    )
+    simplified.remove_unreferenced_vertices()
+    return simplified
+
+
+def ball_pivoting_reconstruction(
+    point_cloud: o3d.geometry.PointCloud,
+    radii: Sequence[float],
+) -> o3d.geometry.TriangleMesh:
+    """Run Ball Pivoting as a fallback when Poisson reconstruction fails."""
+    mesh = o3d.geometry.TriangleMesh.create_from_point_cloud_ball_pivoting(
+        point_cloud,
+        o3d.utility.DoubleVector(list(radii)),
+    )
+    return mesh
+
+
+def write_mesh(path: Path, mesh: o3d.geometry.TriangleMesh) -> None:
+    """Validate and save a triangle mesh."""
+    if mesh.is_empty() or len(mesh.triangles) == 0:
+        raise ValueError("reconstruction produced an empty mesh")
+
+    mesh.compute_vertex_normals()
+    if not o3d.io.write_triangle_mesh(
+        str(path),
+        mesh,
+        write_triangle_uvs=False,
+    ):
+        raise OSError(f"failed to write {path}")
+
+
+def reconstruct_file(
+    source: Path,
+    output_dir: Path,
+    config: ReconstructionConfig,
+) -> tuple[str, Path | None, str | None]:
+    """Reconstruct one point cloud, using Ball Pivoting as a fallback."""
+    point_cloud = preprocess_point_cloud(load_point_cloud(source), config)
+
+    if config.keep_intermediate:
+        cleaned_path = output_dir / f"{source.stem}_cleaned.ply"
+        o3d.io.write_point_cloud(str(cleaned_path), point_cloud)
+
     try:
-        pcd = load_pointcloud(path)
-        if len(pcd.points) == 0:
-            return {"file": path, "status": "empty", "note": "no points"}
-
-        # optional: downsample very dense clouds to speed up (if > max_points)
-        if params["max_points"] and len(pcd.points) > params["max_points"]:
-            pcd = pcd.random_down_sample(float(params["max_points"]) / len(pcd.points))
-
-        # clean + normals
-        pcd = clean_and_estimate_normals(pcd,
-                                         nb_neighbors=params["nb_neighbors"],
-                                         std_ratio=params["std_ratio"],
-                                         knn_normals=params["knn_normals"])
-
-        # save cleaned pointcloud optionally
-        if params["keep_intermediate"]:
-            cleaned_ply = os.path.join(out_dir, f"{basename}_cleaned.ply")
-            o3d.io.write_point_cloud(cleaned_ply, pcd)
-
-        # Poisson reconstruction
-        mesh, densities = poisson_reconstruct(pcd, depth=params["depth"])
-
-        # filter by density quantile
-        mesh = filter_mesh_by_density(mesh, densities, keep_quantile=params["density_quantile"])
-
-        # optional simplify
-        if params["target_triangles"]:
-            mesh = simplify_mesh(mesh, params["target_triangles"])
-
-        # ensure normals and watertight-ish
-        mesh.compute_vertex_normals()
-
-        out_obj = os.path.join(out_dir, f"{basename}.obj")
-        o3d.io.write_triangle_mesh(out_obj, mesh, write_triangle_uvs=False)
-        return {"file": path, "status": "ok", "out_obj": out_obj}
-
-    except Exception as e:
-        # fallback: try Ball Pivoting
+        mesh, densities = poisson_reconstruction(
+            point_cloud,
+            config.poisson_depth,
+        )
+        mesh = remove_low_density_vertices(
+            mesh,
+            densities,
+            config.density_quantile,
+        )
+        method = "poisson"
+        output_path = output_dir / f"{source.stem}.obj"
+    except (RuntimeError, ValueError) as poisson_error:
+        LOGGER.warning(
+            "%s: Poisson reconstruction failed (%s); trying Ball Pivoting",
+            source.name,
+            poisson_error,
+        )
         try:
-            pcd = load_pointcloud(path)
-            pcd = clean_and_estimate_normals(pcd,
-                                             nb_neighbors=params["nb_neighbors"],
-                                             std_ratio=params["std_ratio"],
-                                             knn_normals=params["knn_normals"])
-            mesh_bp = ball_pivoting_reconstruct(pcd, radii=params["bp_radii"])
-            if mesh_bp is not None:
-                if params["target_triangles"]:
-                    mesh_bp = simplify_mesh(mesh_bp, params["target_triangles"])
-                out_obj = os.path.join(out_dir, f"{basename}_bp.obj")
-                o3d.io.write_triangle_mesh(out_obj, mesh_bp)
-                return {"file": path, "status": "ok_bp", "out_obj": out_obj, "note": str(e)}
-        except Exception:
-            pass
+            mesh = ball_pivoting_reconstruction(
+                point_cloud,
+                config.ball_pivoting_radii,
+            )
+        except RuntimeError as ball_pivoting_error:
+            return (
+                source.name,
+                None,
+                f"Poisson: {poisson_error}; Ball Pivoting: {ball_pivoting_error}",
+            )
 
-        return {"file": path, "status": "error", "error": str(e), "trace": traceback.format_exc()}
+        method = "ball-pivoting"
+        output_path = output_dir / f"{source.stem}_bp.obj"
 
-def main():
-    parser = argparse.ArgumentParser(description="Convert pointclouds to watertight OBJ via Poisson (Open3D)")
-    parser.add_argument("--input_dir", type=str, required=True, help="Folder with .ply or .npy generated pointclouds")
-    parser.add_argument("--output_dir", type=str, default="results/meshes", help="Where to save .obj")
-    parser.add_argument("--depth", type=int, default=10, help="Poisson depth (increase -> more detail, more memory)")
-    parser.add_argument("--density_quantile", type=float, default=0.1, help="Remove vertices with density < quantile (0..1)")
-    parser.add_argument("--target_triangles", type=int, default=15000, help="Simplify mesh to this number of triangles (0 = skip)")
-    parser.add_argument("--nb_neighbors", type=int, default=50, help="neighbors for statistical outlier removal")
-    parser.add_argument("--std_ratio", type=float, default=1.0, help="std ratio for outlier removal")
-    parser.add_argument("--knn_normals", type=int, default=30, help="knn for normal estimation")
-    parser.add_argument("--max_points", type=int, default=200000, help="Downsample input if points > this")
-    parser.add_argument("--keep_intermediate", action="store_true", help="Save cleaned pointclouds as _cleaned.ply")
-    parser.add_argument("--open", action="store_true", help="Open each finished mesh in Open3D viewer (slow)")
-    parser.add_argument("--bp_radii", type=float, nargs="+", default=[0.01, 0.02, 0.04], help="Radii for Ball Pivoting fallback")
-    args = parser.parse_args()
+    mesh = simplify_mesh(mesh, config.target_triangles)
 
-    os.makedirs(args.output_dir, exist_ok=True)
+    try:
+        write_mesh(output_path, mesh)
+    except (OSError, ValueError) as error:
+        return source.name, None, str(error)
 
-    files = [f for f in os.listdir(args.input_dir) if f.lower().endswith(SUPPORTED_IN)]
-    files.sort()
-    if len(files) == 0:
-        print("No supported files found in", args.input_dir)
-        return
+    return source.name, output_path, method
 
-    params = {
-        "depth": args.depth,
-        "density_quantile": args.density_quantile,
-        "target_triangles": args.target_triangles if args.target_triangles > 0 else None,
-        "nb_neighbors": args.nb_neighbors,
-        "std_ratio": args.std_ratio,
-        "knn_normals": args.knn_normals,
-        "max_points": args.max_points,
-        "keep_intermediate": args.keep_intermediate,
-        "bp_radii": args.bp_radii
-    }
 
-    results = []
-    for fn in tqdm(files, desc="Convert"):
-        path = os.path.join(args.input_dir, fn)
-        res = process_file(path, args.output_dir, params)
-        results.append(res)
-        if res.get("status") in ("ok", "ok_bp"):
-            print(f"[OK] {fn} -> {os.path.basename(res['out_obj'])}")
-            if args.open:
-                try:
-                    mesh = o3d.io.read_triangle_mesh(res["out_obj"])
-                    mesh.compute_vertex_normals()
-                    o3d.visualization.draw_geometries([mesh])
-                except Exception:
-                    pass
-        else:
-            print(f"[ERR] {fn} : {res.get('error') or res.get('note')}")
+def find_point_cloud_files(directory: Path) -> list[Path]:
+    """Find supported files, preferring NPY when stems are duplicated."""
+    if not directory.is_dir():
+        raise FileNotFoundError(f"input directory not found: {directory}")
 
-    # Summary
-    n_ok = sum(1 for r in results if r.get("status") in ("ok", "ok_bp"))
-    n_err = sum(1 for r in results if r.get("status") == "error")
-    print("Done. Success:", n_ok, "Errors:", n_err)
-    print("Output dir:", args.output_dir)
+    priority = {".npy": 0, ".ply": 1, ".pcd": 2, ".xyz": 3}
+    by_stem: dict[str, Path] = {}
+
+    for path in sorted(directory.iterdir()):
+        suffix = path.suffix.lower()
+        if suffix not in SUPPORTED_EXTENSIONS:
+            continue
+
+        current = by_stem.get(path.stem)
+        if current is None or priority[suffix] < priority[current.suffix.lower()]:
+            by_stem[path.stem] = path
+
+    return sorted(by_stem.values())
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--input-dir",
+        type=Path,
+        default=PROJECT_ROOT / "results" / "generated",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=PROJECT_ROOT / "results" / "meshes",
+    )
+    parser.add_argument("--depth", type=int, default=10)
+    parser.add_argument("--density-quantile", type=float, default=0.1)
+    parser.add_argument("--target-triangles", type=int, default=15_000)
+    parser.add_argument("--outlier-neighbors", type=int, default=50)
+    parser.add_argument("--outlier-std-ratio", type=float, default=1.0)
+    parser.add_argument("--normal-neighbors", type=int, default=30)
+    parser.add_argument("--max-points", type=int, default=200_000)
+    parser.add_argument(
+        "--ball-pivoting-radii",
+        type=float,
+        nargs="+",
+        default=(0.01, 0.02, 0.04),
+    )
+    parser.add_argument("--keep-intermediate", action="store_true")
+    parser.add_argument(
+        "--show",
+        action="store_true",
+        help="Open each reconstructed mesh in the Open3D viewer.",
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+
+    config = ReconstructionConfig(
+        poisson_depth=args.depth,
+        density_quantile=args.density_quantile,
+        target_triangles=(
+            args.target_triangles if args.target_triangles > 0 else None
+        ),
+        outlier_neighbors=args.outlier_neighbors,
+        outlier_std_ratio=args.outlier_std_ratio,
+        normal_neighbors=args.normal_neighbors,
+        max_points=args.max_points if args.max_points > 0 else None,
+        ball_pivoting_radii=tuple(args.ball_pivoting_radii),
+        keep_intermediate=args.keep_intermediate,
+    )
+
+    files = find_point_cloud_files(args.input_dir)
+    if not files:
+        raise SystemExit(f"No supported point clouds found in {args.input_dir}")
+
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    succeeded = 0
+
+    for source in tqdm(files, desc="Reconstructing meshes"):
+        name, output_path, message = reconstruct_file(
+            source,
+            args.output_dir,
+            config,
+        )
+
+        if output_path is None:
+            LOGGER.error("%s: %s", name, message)
+            continue
+
+        succeeded += 1
+        LOGGER.info("%s -> %s (%s)", name, output_path.name, message)
+
+        if args.show:
+            mesh = o3d.io.read_triangle_mesh(str(output_path))
+            mesh.compute_vertex_normals()
+            o3d.visualization.draw_geometries([mesh])
+
+    LOGGER.info(
+        "Finished: reconstructed %d of %d point clouds",
+        succeeded,
+        len(files),
+    )
+
 
 if __name__ == "__main__":
     main()

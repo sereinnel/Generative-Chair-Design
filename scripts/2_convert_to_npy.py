@@ -1,240 +1,248 @@
-#2_convert_to_npy.py
-"""
-Конвертация нормализованных мешей в облака точек (.npy)
-Используем равномерное сэмплирование с фиксированным количеством точек
-"""
+"""Sample fixed-size point clouds from normalized chair meshes."""
 
-import os
+from __future__ import annotations
+
+import argparse
+import logging
+import multiprocessing
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from pathlib import Path
+
 import numpy as np
 import open3d as o3d
 from tqdm import tqdm
-import multiprocessing
-from functools import partial
 
-def convert_single_file(off_path, npy_path, num_points=4096):
-    """
-    Конвертирует один .off файл в .npy с фиксированным количеством точек
-    
-    Аргументы:
-        off_path: путь к .off файлу
-        npy_path: путь для сохранения .npy
-        num_points: количество точек в облаке
-    
-    Возвращает:
-        True при успехе, False при ошибке
-    """
-    try:
-        # Загрузка меша
-        mesh = o3d.io.read_triangle_mesh(off_path)
-        if len(mesh.vertices) == 0:
-            print(f"  ⚠️ Пустой меш: {os.path.basename(off_path)}")
-            return False
-        
-        # Равномерное сэмплирование точек с поверхности
-        pcd = mesh.sample_points_uniformly(number_of_points=num_points)
-        
-        # Получаем точки как numpy array
-        points = np.asarray(pcd.points, dtype=np.float32)
-        
-        # Проверяем корректность
-        if points.shape != (num_points, 3):
-            print(f"  ⚠️ Неправильная форма: {points.shape} для {os.path.basename(off_path)}")
-            return False
-        
-        # Сохраняем в .npy
-        np.save(npy_path, points)
-        
-        return True
-        
-    except Exception as e:
-        print(f"  ❌ Ошибка при конвертации {off_path}: {e}")
-        return False
+LOGGER = logging.getLogger(__name__)
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
-def process_batch(file_list, input_dir, output_dir, num_points=4096):
-    """
-    Обрабатывает батч файлов (для многопроцессорности)
-    """
-    success_count = 0
-    for filename in file_list:
-        off_path = os.path.join(input_dir, filename)
-        npy_filename = filename.replace('.off', '.npy')
-        npy_path = os.path.join(output_dir, npy_filename)
-        
-        if convert_single_file(off_path, npy_path, num_points):
-            success_count += 1
-    
-    return success_count
 
-def convert_dataset(input_dir, output_dir, num_points=4096, num_workers=4):
-    """
-    Конвертирует все .off файлы в директории в .npy
-    
-    Аргументы:
-        input_dir: папка с .off файлами
-        output_dir: папка для сохранения .npy
-        num_points: количество точек в каждом облаке
-        num_workers: количество процессов для параллельной обработки
-    """
-    os.makedirs(output_dir, exist_ok=True)
-    
-    # Получаем список файлов
-    off_files = [f for f in os.listdir(input_dir) if f.lower().endswith('.off')]
-    
-    if not off_files:
-        print(f"⚠️ Нет .off файлов в {input_dir}")
-        return 0
-    
-    print(f"📁 Конвертация {len(off_files)} файлов из {input_dir}")
-    print(f"  Количество точек на облако: {num_points}")
-    print(f"  Количество процессов: {num_workers}")
-    
-    # Если мало файлов или один воркер, обрабатываем последовательно
-    if len(off_files) < 50 or num_workers == 1:
-        success_count = 0
-        for filename in tqdm(off_files, desc="Конвертация"):
-            off_path = os.path.join(input_dir, filename)
-            npy_filename = filename.replace('.off', '.npy')
-            npy_path = os.path.join(output_dir, npy_filename)
-            
-            if convert_single_file(off_path, npy_path, num_points):
-                success_count += 1
-        
-        return success_count
-    
-    # Многопроцессорная обработка
-    else:
-        # Разделяем файлы на батчи
-        batch_size = len(off_files) // num_workers
-        batches = [off_files[i:i + batch_size] for i in range(0, len(off_files), batch_size)]
-        
-        # Создаем partial функцию с фиксированными аргументами
-        process_func = partial(
-            process_batch,
-            input_dir=input_dir,
-            output_dir=output_dir,
-            num_points=num_points
+def sample_mesh(source: Path, destination: Path, num_points: int) -> None:
+    """Sample one mesh surface and store the result as a float32 array."""
+    mesh = o3d.io.read_triangle_mesh(str(source))
+
+    if mesh.is_empty() or len(mesh.vertices) == 0:
+        raise ValueError("mesh contains no vertices")
+    if len(mesh.triangles) == 0:
+        raise ValueError("mesh contains no triangles")
+
+    point_cloud = mesh.sample_points_uniformly(number_of_points=num_points)
+    points = np.asarray(point_cloud.points, dtype=np.float32)
+
+    if points.shape != (num_points, 3):
+        raise ValueError(
+            f"expected sampled points with shape ({num_points}, 3), got {points.shape}"
         )
-        
-        # Запускаем процессы
-        with multiprocessing.Pool(processes=num_workers) as pool:
-            results = list(tqdm(
-                pool.imap(process_func, batches),
-                total=len(batches),
-                desc="Конвертация (многопроцесс)"
-            ))
-        
-        return sum(results)
+    if not np.isfinite(points).all():
+        raise ValueError("sampled point cloud contains NaN or infinite values")
 
-def validate_point_clouds(npy_dir, num_points=4096, num_samples=5):
-    """
-    Проверяет корректность сгенерированных облаков точек
-    
-    Аргументы:
-        npy_dir: папка с .npy файлами
-        num_points: ожидаемое количество точек
-        num_samples: сколько файлов проверить
-    """
-    print("\n🔍 ВАЛИДАЦИЯ ОБЛАКОВ ТОЧЕК:")
-    
-    npy_files = [f for f in os.listdir(npy_dir) if f.endswith('.npy')]
-    
-    if not npy_files:
-        print("  ⚠️ Нет .npy файлов для проверки")
-        return
-    
-    # Проверяем несколько случайных файлов
-    import random
-    sample_files = random.sample(npy_files, min(num_samples, len(npy_files)))
-    
-    for filename in sample_files:
-        npy_path = os.path.join(npy_dir, filename)
-        points = np.load(npy_path)
-        
-        print(f"\n  Файл: {filename}")
-        print(f"    Форма: {points.shape} (ожидается ({num_points}, 3))")
-        print(f"    Диапазон X: [{points[:, 0].min():.3f}, {points[:, 0].max():.3f}]")
-        print(f"    Диапазон Y: [{points[:, 1].min():.3f}, {points[:, 1].max():.3f}]")
-        print(f"    Диапазон Z: [{points[:, 2].min():.3f}, {points[:, 2].max():.3f}]")
-        print(f"    Среднее: [{points[:, 0].mean():.3f}, {points[:, 1].mean():.3f}, {points[:, 2].mean():.3f}]")
-        
-        # Проверяем наличие NaN или Inf
-        if np.any(np.isnan(points)):
-            print("    ❌ Обнаружены NaN значения!")
-        if np.any(np.isinf(points)):
-            print("    ❌ Обнаружены Inf значения!")
-        
-        # Проверяем, что высота нормализована к 1.0
-        height = points[:, 2].max() - points[:, 2].min()
-        if abs(height - 1.0) > 0.05:  # допуск 5%
-            print(f"    ⚠️ Высота отличается от 1.0: {height:.3f}")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    np.save(destination, points)
 
-def main():
-    print("=" * 60)
-    print("КОНВЕРТАЦИЯ МЕШЕЙ В ОБЛАКА ТОЧЕК")
-    print("=" * 60)
-    
-    # Настройки
-    NUM_POINTS = 16384  # Увеличиваем для лучшей детализации
-    NUM_WORKERS = 6    # Количество процессов
-    
-    # Пути
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    project_root = os.path.dirname(base_dir)
-    
-    # Входные директории (нормализованные .off)
-    norm_train_dir = os.path.join(project_root, "data", "normalized_off", "train")
-    norm_test_dir = os.path.join(project_root, "data", "normalized_off", "test")
-    
-    # Выходные директории (.npy)
-    npy_train_dir = os.path.join(project_root, "data", "normalized_npy", "train")
-    npy_test_dir = os.path.join(project_root, "data", "normalized_npy", "test")
-    
-    # Проверяем существование входных данных
-    if not os.path.exists(norm_train_dir):
-        print(f"❌ Не найдена папка с нормализованными данными: {norm_train_dir}")
-        print("Сначала запустите скрипт 1_normalize_off.py")
+
+def _sample_worker(task: tuple[Path, Path, int]) -> tuple[str, str | None]:
+    """Process-pool entry point."""
+    source, destination, num_points = task
+    try:
+        sample_mesh(source, destination, num_points)
+    except (OSError, RuntimeError, ValueError) as error:
+        return source.name, str(error)
+    return source.name, None
+
+
+def convert_split(
+    input_dir: Path,
+    output_dir: Path,
+    num_points: int,
+    workers: int,
+) -> tuple[int, int]:
+    """Convert every normalized OFF file in one dataset split."""
+    if not input_dir.is_dir():
+        LOGGER.warning("Skipping missing directory: %s", input_dir)
+        return 0, 0
+
+    source_files = sorted(
+        path for path in input_dir.iterdir() if path.suffix.lower() == ".off"
+    )
+    if not source_files:
+        LOGGER.warning("No OFF files found in %s", input_dir)
+        return 0, 0
+
+    tasks = [
+        (source, output_dir / f"{source.stem}.npy", num_points)
+        for source in source_files
+    ]
+    succeeded = 0
+
+    if workers <= 1:
+        for task in tqdm(tasks, desc=f"Sampling {input_dir.name}"):
+            filename, error = _sample_worker(task)
+            if error is None:
+                succeeded += 1
+            else:
+                LOGGER.warning("Could not process %s: %s", filename, error)
+        return succeeded, len(tasks)
+
+    with ProcessPoolExecutor(max_workers=workers) as executor:
+        futures = [executor.submit(_sample_worker, task) for task in tasks]
+        for future in tqdm(
+            as_completed(futures),
+            total=len(futures),
+            desc=f"Sampling {input_dir.name}",
+        ):
+            filename, error = future.result()
+            if error is None:
+                succeeded += 1
+            else:
+                LOGGER.warning("Could not process %s: %s", filename, error)
+
+    return succeeded, len(tasks)
+
+
+def validate_arrays(
+    directory: Path,
+    num_points: int,
+    num_samples: int,
+    seed: int,
+) -> None:
+    """Check a small deterministic sample of generated arrays."""
+    paths = sorted(directory.glob("*.npy"))
+    if not paths:
+        LOGGER.warning("No point clouds found in %s", directory)
         return
-    
-    # Конвертируем тренировочные данные
-    print("\n🔧 КОНВЕРТАЦИЯ ТРЕНИРОВОЧНЫХ ДАННЫХ")
-    train_success = convert_dataset(
-        norm_train_dir, npy_train_dir, 
-        num_points=NUM_POINTS, 
-        num_workers=NUM_WORKERS
+
+    rng = np.random.default_rng(seed)
+    selected_indices = rng.choice(
+        len(paths),
+        size=min(num_samples, len(paths)),
+        replace=False,
     )
-    
-    # Конвертируем тестовые данные
-    print("\n🔧 КОНВЕРТАЦИЯ ТЕСТОВЫХ ДАННЫХ")
-    test_success = convert_dataset(
-        norm_test_dir, npy_test_dir, 
-        num_points=NUM_POINTS, 
-        num_workers=NUM_WORKERS
+
+    for index in selected_indices:
+        path = paths[int(index)]
+        points = np.load(path)
+
+        if points.shape != (num_points, 3):
+            raise ValueError(f"{path} has unexpected shape {points.shape}")
+        if points.dtype != np.float32:
+            raise ValueError(f"{path} has unexpected dtype {points.dtype}")
+        if not np.isfinite(points).all():
+            raise ValueError(f"{path} contains NaN or infinite values")
+
+        height = float(points[:, 2].max() - points[:, 2].min())
+        if not np.isclose(height, 1.0, atol=0.05):
+            LOGGER.warning("%s has height %.3f instead of approximately 1.0", path, height)
+
+
+def write_dataset_info(
+    path: Path,
+    train_count: int,
+    validation_count: int,
+    num_points: int,
+) -> None:
+    """Write a concise description of the processed dataset."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "\n".join(
+            [
+                "CHAIR DATASET",
+                "=============",
+                f"Training samples: {train_count}",
+                f"Validation samples: {validation_count}",
+                f"Points per cloud: {num_points}",
+                "Normalization: unit height, floor at z = 0, centered in XY",
+                f"Array format: float32, shape ({num_points}, 3)",
+                "",
+            ]
+        ),
+        encoding="utf-8",
     )
-    
-    # Итоги
-    print("\n" + "=" * 60)
-    print("ИТОГИ КОНВЕРТАЦИИ:")
-    print(f"  Тренировочные: {train_success} файлов")
-    print(f"  Тестовые: {test_success} файлов")
-    
-    # Проверяем результат
-    if train_success > 0:
-        validate_point_clouds(npy_train_dir, NUM_POINTS)
-    
-    # Создаем файл с информацией о датасете
-    info_path = os.path.join(project_root, "data", "dataset_info.txt")
-    with open(info_path, 'w') as f:
-        f.write(f"CHAIR DATASET INFO\n")
-        f.write(f"==================\n")
-        f.write(f"Training samples: {train_success}\n")
-        f.write(f"Test samples: {test_success}\n")
-        f.write(f"Points per cloud: {NUM_POINTS}\n")
-        f.write(f"Normalized: yes (height=1.0, floor at z=0)\n")
-        f.write(f"Data format: .npy (float32, shape: ({NUM_POINTS}, 3))\n")
-    
-    print(f"\n📊 Информация о датасете сохранена в: {info_path}")
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Sample point clouds from normalized chair meshes."
+    )
+    parser.add_argument(
+        "--input-root",
+        type=Path,
+        default=PROJECT_ROOT / "data" / "normalized_off",
+    )
+    parser.add_argument(
+        "--output-root",
+        type=Path,
+        default=PROJECT_ROOT / "data" / "normalized_npy",
+    )
+    parser.add_argument("--num-points", type=int, default=16_384)
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=max(1, min(6, multiprocessing.cpu_count())),
+    )
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--validation-samples", type=int, default=5)
+    parser.add_argument(
+        "--train-split",
+        default="train",
+        help="Name of the training split directory.",
+    )
+    parser.add_argument(
+        "--validation-split",
+        default="test",
+        help="Directory used as validation data in the original experiment.",
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+
+    if args.num_points <= 0:
+        raise SystemExit("--num-points must be positive")
+    if args.workers <= 0:
+        raise SystemExit("--workers must be positive")
+
+    train_success, train_total = convert_split(
+        args.input_root / args.train_split,
+        args.output_root / args.train_split,
+        args.num_points,
+        args.workers,
+    )
+    validation_success, validation_total = convert_split(
+        args.input_root / args.validation_split,
+        args.output_root / args.validation_split,
+        args.num_points,
+        args.workers,
+    )
+
+    LOGGER.info(
+        "Training split: processed %d of %d files",
+        train_success,
+        train_total,
+    )
+    LOGGER.info(
+        "Validation split: processed %d of %d files",
+        validation_success,
+        validation_total,
+    )
+
+    if train_success == 0:
+        raise SystemExit("No training point clouds were created.")
+
+    validate_arrays(
+        args.output_root / args.train_split,
+        args.num_points,
+        args.validation_samples,
+        args.seed,
+    )
+    write_dataset_info(
+        PROJECT_ROOT / "data" / "dataset_info.txt",
+        train_success,
+        validation_success,
+        args.num_points,
+    )
+
 
 if __name__ == "__main__":
-    # На Windows при использовании многопроцессорности нужно это условие
     multiprocessing.freeze_support()
     main()

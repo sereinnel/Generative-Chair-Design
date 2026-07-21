@@ -1,102 +1,248 @@
-# scripts/visualize_vae.py
-import os
+"""Visualize random generations or deterministic VAE reconstructions."""
+
+from __future__ import annotations
+
 import argparse
-import torch
+import logging
+import math
+from pathlib import Path
+from typing import Any, Mapping
+
+import matplotlib.pyplot as plt
 import numpy as np
 import open3d as o3d
+import torch
 
-from model_improved import PointNetVAE
+from model import PointNetVAE
 
-RESULTS_DIR = "results/visualization"
+LOGGER = logging.getLogger(__name__)
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
-def save_ply(points, path):
-    """Сохраняет облако точек в формате .ply"""
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(points)
-    o3d.io.write_point_cloud(path, pcd)
 
-def visualize_open3d(points):
-    """Показывает облако точек через Open3D"""
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(points)
-    o3d.visualization.draw_geometries([pcd])
+def extract_state_dict(checkpoint: Any) -> Mapping[str, torch.Tensor]:
+    """Extract model weights from common checkpoint formats."""
+    if not isinstance(checkpoint, Mapping):
+        raise TypeError("checkpoint must be a mapping")
 
-def generate_random_samples(model, device, num_points=4096, n_samples=5, open3d_view=False):
+    for key in ("model_state", "model_state_dict"):
+        value = checkpoint.get(key)
+        if isinstance(value, Mapping):
+            return value
+
+    if checkpoint and all(isinstance(value, torch.Tensor) for value in checkpoint.values()):
+        return checkpoint
+
+    raise ValueError("checkpoint does not contain a recognizable model state")
+
+
+def load_model(
+    checkpoint_path: Path,
+    device: torch.device,
+    num_points: int,
+    latent_dim: int,
+) -> PointNetVAE:
+    """Load a trained model for visualization."""
+    model = PointNetVAE(
+        num_points=num_points,
+        latent_dim=latent_dim,
+    ).to(device)
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    model.load_state_dict(extract_state_dict(checkpoint))
     model.eval()
-    os.makedirs(RESULTS_DIR, exist_ok=True)
+    return model
 
-    with torch.no_grad():
-        for i in range(n_samples):
-            z = torch.randn(1, model.latent_dim).to(device)
-            x_recon = model.decode(z)  # [1, N, 3]
-            points = x_recon.squeeze(0).cpu().numpy()
 
-            ply_path = os.path.join(RESULTS_DIR, f"random_{i:02d}.ply")
-            save_ply(points, ply_path)
-            print(f"Saved: {ply_path}")
+def sample_input(points: np.ndarray, count: int, rng: np.random.Generator) -> np.ndarray:
+    """Sample a fixed-size encoder input from an NPY point cloud."""
+    replace = len(points) < count
+    indices = rng.choice(len(points), size=count, replace=replace)
+    return points[indices].astype(np.float32, copy=False)
 
-            if open3d_view:
-                visualize_open3d(points)
 
-def reconstruct_samples(model, device, npy_dir, open3d_view=False):
-    model.eval()
-    os.makedirs(RESULTS_DIR, exist_ok=True)
+@torch.inference_mode()
+def random_generations(
+    model: PointNetVAE,
+    device: torch.device,
+    count: int,
+    latent_scale: float,
+) -> list[np.ndarray]:
+    """Decode random samples from the unit Gaussian prior."""
+    latent = torch.randn(
+        count,
+        model.latent_dim,
+        device=device,
+    ) * latent_scale
+    return [
+        points.astype(np.float32)
+        for points in model.decode(latent).cpu().numpy()
+    ]
 
-    files = [f for f in os.listdir(npy_dir) if f.endswith('.npy')]
-    with torch.no_grad():
-        for f in files:
-            path = os.path.join(npy_dir, f)
-            x = np.load(path)  # [N, 3]
-            x_tensor = torch.tensor(x, dtype=torch.float32).unsqueeze(0).to(device)  # [1, N, 3]
-            x_tensor = x_tensor.transpose(1, 2).contiguous()  # [1, 3, N]
 
-            z_mu, _ = model.encode(x_tensor)
-            x_recon = model.decode(z_mu)  # [1, N, 3]
-            points = x_recon.squeeze(0).cpu().numpy()
+@torch.inference_mode()
+def reconstructions(
+    model: PointNetVAE,
+    device: torch.device,
+    directory: Path,
+    count: int,
+    input_points: int,
+    rng: np.random.Generator,
+) -> list[np.ndarray]:
+    """Decode latent means for the first point clouds in a directory."""
+    paths = sorted(directory.glob("*.npy"))[:count]
+    if not paths:
+        raise FileNotFoundError(f"No NPY files found in {directory}")
 
-            ply_path = os.path.join(RESULTS_DIR, f"recon_{os.path.splitext(f)[0]}.ply")
-            save_ply(points, ply_path)
-            print(f"Saved reconstruction: {ply_path}")
+    outputs: list[np.ndarray] = []
 
-            if open3d_view:
-                visualize_open3d(points)
+    for path in paths:
+        points = np.load(path).astype(np.float32, copy=False)
+        sampled = sample_input(points, input_points, rng)
+        tensor = torch.from_numpy(sampled).unsqueeze(0).to(device)
+        encoder_input = tensor.transpose(1, 2).contiguous()
 
-def main(args):
+        mean, _ = model.encode(encoder_input)
+        reconstruction = model.decode(mean)[0].cpu().numpy().astype(np.float32)
+        outputs.append(reconstruction)
+
+    return outputs
+
+
+def save_ply(points: np.ndarray, path: Path) -> None:
+    """Save one point cloud as PLY."""
+    point_cloud = o3d.geometry.PointCloud()
+    point_cloud.points = o3d.utility.Vector3dVector(
+        points.astype(np.float64, copy=False)
+    )
+    if not o3d.io.write_point_cloud(str(path), point_cloud):
+        raise OSError(f"failed to write {path}")
+
+
+def set_equal_axes(ax: plt.Axes, points: np.ndarray) -> None:
+    """Set equal axis lengths around a point cloud."""
+    minimum = points.min(axis=0)
+    maximum = points.max(axis=0)
+    center = 0.5 * (minimum + maximum)
+    radius = 0.5 * float((maximum - minimum).max())
+
+    ax.set_xlim(center[0] - radius, center[0] + radius)
+    ax.set_ylim(center[1] - radius, center[1] + radius)
+    ax.set_zlim(center[2] - radius, center[2] + radius)
+
+
+def save_grid(
+    point_clouds: list[np.ndarray],
+    output_path: Path,
+    title: str,
+) -> None:
+    """Save point clouds in a compact Matplotlib grid."""
+    columns = min(3, len(point_clouds))
+    rows = math.ceil(len(point_clouds) / columns)
+    figure = plt.figure(figsize=(5 * columns, 4.5 * rows))
+    figure.suptitle(title)
+
+    for index, points in enumerate(point_clouds, start=1):
+        axis = figure.add_subplot(rows, columns, index, projection="3d")
+        axis.scatter(
+            points[:, 0],
+            points[:, 1],
+            points[:, 2],
+            c=points[:, 2],
+            s=0.4,
+            alpha=0.7,
+        )
+        axis.set_title(f"Sample {index}")
+        axis.set_axis_off()
+        set_equal_axes(axis, points)
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    figure.tight_layout()
+    figure.savefig(output_path, dpi=180, bbox_inches="tight")
+    plt.close(figure)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--checkpoint",
+        type=Path,
+        default=PROJECT_ROOT / "models" / "pointnet_vae_best.pth",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=("random", "reconstruct"),
+        default="random",
+    )
+    parser.add_argument("--num-samples", type=int, default=6)
+    parser.add_argument("--num-points", type=int, default=16_384)
+    parser.add_argument("--input-points", type=int, default=4096)
+    parser.add_argument("--latent-dim", type=int, default=256)
+    parser.add_argument("--latent-scale", type=float, default=1.0)
+    parser.add_argument(
+        "--input-dir",
+        type=Path,
+        default=PROJECT_ROOT / "data" / "normalized_npy" / "test",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=PROJECT_ROOT / "results" / "visualization",
+    )
+    parser.add_argument("--seed", type=int, default=42)
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+
+    if not args.checkpoint.is_file():
+        raise SystemExit(f"Checkpoint not found: {args.checkpoint}")
+    if args.num_samples <= 0:
+        raise SystemExit("--num-samples must be positive")
+
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+    rng = np.random.default_rng(args.seed)
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print("Device:", device)
+    LOGGER.info("Using device: %s", device)
 
-    # Создаём модель
-    model = PointNetVAE(latent_dim=args.latent_dim, num_points=args.num_points).to(device)
+    model = load_model(
+        args.checkpoint,
+        device,
+        args.num_points,
+        args.latent_dim,
+    )
 
-    # Загружаем чекпойнт
-    model_path = args.model_path
-    checkpoint = torch.load(model_path, map_location=device)
-    
-    # Поддержка старых и новых форматов чекпойнта
-    if "model_state" in checkpoint:
-        state_dict = checkpoint["model_state"]
+    if args.mode == "random":
+        point_clouds = random_generations(
+            model,
+            device,
+            args.num_samples,
+            args.latent_scale,
+        )
+        title = "Random VAE generations"
     else:
-        state_dict = checkpoint
-    model.load_state_dict(state_dict)
-    print("Model loaded:", model_path)
+        point_clouds = reconstructions(
+            model,
+            device,
+            args.input_dir,
+            args.num_samples,
+            args.input_points,
+            rng,
+        )
+        title = "VAE reconstructions"
 
-    # Генерация и/или реконструкция
-    if args.mode in ["random", "both"]:
-        print("Generating random samples...")
-        generate_random_samples(model, device, num_points=args.num_points, open3d_view=args.open3d)
-    
-    if args.mode in ["reconstruct", "both"]:
-        npy_dir = os.path.join("data", "normalized_npy", "test")
-        print("Reconstructing samples from:", npy_dir)
-        reconstruct_samples(model, device, npy_dir, open3d_view=args.open3d)
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    for index, points in enumerate(point_clouds):
+        stem = args.output_dir / f"{args.mode}_{index:03d}"
+        np.save(stem.with_suffix(".npy"), points)
+        save_ply(points, stem.with_suffix(".ply"))
+
+    grid_path = args.output_dir / f"{args.mode}_grid.png"
+    save_grid(point_clouds, grid_path, title)
+    LOGGER.info("Saved %d point clouds and %s", len(point_clouds), grid_path)
+
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--model_path", type=str, default="models/model_improved_best.pth")
-    parser.add_argument("--mode", type=str, choices=["random", "reconstruct", "both"], default="both")
-    parser.add_argument("--num_points", type=int, default=4096)
-    parser.add_argument("--latent_dim", type=int, default=256)
-    parser.add_argument("--open3d", action="store_true")
-    args = parser.parse_args()
-
-    main(args)
+    main()

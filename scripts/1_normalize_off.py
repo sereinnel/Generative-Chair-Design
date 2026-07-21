@@ -1,162 +1,159 @@
-#1_normalize_off.py
-"""
-Нормализация мешей стульев с сохранением структуры
-Ключевые изменения:
-1. Сохраняем ориентацию (не центрируем по X/Y)
-2. Масштабируем пропорционально высоте
-3. Гарантируем, что пол всегда в Z=0
-"""
+"""Normalize ModelNet chair meshes before point-cloud sampling."""
 
-import os
+from __future__ import annotations
+
+import argparse
+import logging
+from dataclasses import dataclass
+from pathlib import Path
+
 import numpy as np
 import open3d as o3d
 from tqdm import tqdm
 
-def normalize_chair_mesh(off_path, output_path):
-    """
-    Нормализует меш стула для генеративного обучения
-    
-    Аргументы:
-        off_path: путь к исходному .off файлу
-        output_path: путь для сохранения нормализованного .off
-    
-    Возвращает:
-        True при успехе, False при ошибке
-    """
-    try:
-        # Загрузка меша
-        mesh = o3d.io.read_triangle_mesh(off_path)
-        if len(mesh.vertices) == 0:
-            print(f"  ⚠️ Пустой меш: {os.path.basename(off_path)}")
-            return False
-        
-        vertices = np.asarray(mesh.vertices, dtype=np.float32)
-        
-        # === КРИТИЧЕСКИ ВАЖНО: ПРАВИЛЬНАЯ НОРМАЛИЗАЦИЯ ===
-        
-        # 1. Выравнивание по полу: самая низкая точка = 0
-        z_min = np.min(vertices[:, 2])
-        vertices[:, 2] -= z_min
-        
-        # 2. Находим ВЫСОТУ стула (максимум по Z после выравнивания)
-        height = np.max(vertices[:, 2])
-        if height < 0.001:  # защита от деления на 0
-            print(f"  ⚠️ Нулевая высота: {os.path.basename(off_path)}")
-            height = 1.0
-        
-        # 3. Масштабируем ВСЕ оси на одинаковый коэффициент
-        #    Это сохраняет пропорции стула!
-        scale = 1.0 / height
-        vertices *= scale
-        
-        # 4. НЕ центрируем по X и Y! Это сохраняет естественную ориентацию
-        #    Но можем слегка сдвинуть, чтобы центр масс был в XY-плоскости
-        #    (не обязательно, но помогает обучению)
-        center_x = np.mean(vertices[:, 0])
-        center_y = np.mean(vertices[:, 1])
-        vertices[:, 0] -= center_x
-        vertices[:, 1] -= center_y
-        
-        # 5. Проверяем результат
-        #    - Пол должен быть в Z=0
-        #    - Высота должна быть примерно 1.0
-        #    - Ширина/глубина должны быть < 1.0 (стулья обычно шире, чем выше)
-        
-        # Обновляем меш
-        mesh.vertices = o3d.utility.Vector3dVector(vertices)
-        
-        # Сохраняем
-        o3d.io.write_triangle_mesh(output_path, mesh)
-        
-        # Логирование для отладки
-        bbox = mesh.get_axis_aligned_bounding_box()
-        bbox_size = bbox.get_extent()
-        print(f"  ✅ {os.path.basename(off_path):30} | "
-              f"Размер: {bbox_size[0]:.2f}x{bbox_size[1]:.2f}x{bbox_size[2]:.2f} | "
-              f"Высота: {bbox_size[2]:.2f}")
-        
-        return True
-        
-    except Exception as e:
-        print(f"  ❌ Ошибка при обработке {off_path}: {e}")
-        return False
+LOGGER = logging.getLogger(__name__)
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
-def process_dataset(input_dir, output_dir):
-    """
-    Обрабатывает все .off файлы в директории
-    """
-    os.makedirs(output_dir, exist_ok=True)
-    
-    # Получаем список файлов
-    off_files = [f for f in os.listdir(input_dir) if f.lower().endswith('.off')]
-    
-    if not off_files:
-        print(f"⚠️ Нет .off файлов в {input_dir}")
-        return 0
-    
-    print(f"📁 Обработка {len(off_files)} файлов из {input_dir}")
-    
-    success_count = 0
-    for filename in tqdm(off_files, desc="Нормализация"):
-        input_path = os.path.join(input_dir, filename)
-        output_path = os.path.join(output_dir, filename)
-        
-        if normalize_chair_mesh(input_path, output_path):
-            success_count += 1
-    
-    return success_count
 
-def main():
-    print("=" * 60)
-    print("НОРМАЛИЗАЦИЯ МЕШЕЙ СТУЛЬЕВ")
-    print("=" * 60)
-    
-    # Пути для нового эксперимента
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    project_root = os.path.dirname(base_dir)  # поднимаемся на уровень выше scripts/
-    
-    # Директории
-    raw_train_dir = os.path.join(project_root, "data", "raw", "train")
-    raw_test_dir = os.path.join(project_root, "data", "raw", "test")
-    
-    norm_train_dir = os.path.join(project_root, "data", "normalized_off", "train")
-    norm_test_dir = os.path.join(project_root, "data", "normalized_off", "test")
-    
-    # Проверяем существование исходных данных
-    if not os.path.exists(raw_train_dir):
-        print(f"❌ Не найдена папка с исходными данными: {raw_train_dir}")
-        print("Убедитесь, что вы скопировали .off файлы в data/raw/train/")
-        return
-    
-    # Обработка тренировочных данных
-    print("\n🔧 НОРМАЛИЗАЦИЯ ТРЕНИРОВОЧНЫХ ДАННЫХ")
-    train_success = process_dataset(raw_train_dir, norm_train_dir)
-    
-    # Обработка тестовых данных
-    print("\n🔧 НОРМАЛИЗАЦИЯ ТЕСТОВЫХ ДАННЫХ")
-    test_success = process_dataset(raw_test_dir, norm_test_dir)
-    
-    # Итоги
-    print("\n" + "=" * 60)
-    print("ИТОГИ НОРМАЛИЗАЦИИ:")
-    print(f"  Тренировочные: {train_success} из {len(os.listdir(raw_train_dir))}")
-    print(f"  Тестовые: {test_success} из {len(os.listdir(raw_test_dir))}")
-    
-    # Пример проверки нормализации
-    if train_success > 0:
-        print("\n📏 ПРИМЕР НОРМАЛИЗОВАННОГО СТУЛА:")
-        sample_file = os.listdir(norm_train_dir)[0]
-        sample_path = os.path.join(norm_train_dir, sample_file)
-        
-        mesh = o3d.io.read_triangle_mesh(sample_path)
-        vertices = np.asarray(mesh.vertices)
-        
-        print(f"  Файл: {sample_file}")
-        print(f"  Количество вершин: {len(vertices)}")
-        print(f"  Z диапазон: [{vertices[:, 2].min():.3f}, {vertices[:, 2].max():.3f}]")
-        print(f"  Высота: {vertices[:, 2].max() - vertices[:, 2].min():.3f}")
-        print(f"  Центр: [{vertices[:, 0].mean():.3f}, "
-              f"{vertices[:, 1].mean():.3f}, {vertices[:, 2].mean():.3f}]")
+@dataclass(frozen=True)
+class MeshExtent:
+    """Axis-aligned dimensions of a normalized mesh."""
+
+    width: float
+    depth: float
+    height: float
+
+
+def normalize_mesh(source: Path, destination: Path) -> MeshExtent:
+    """Normalize one mesh and save it as an OFF file.
+
+    The lowest point is moved to ``z = 0``. All coordinates are then
+    scaled by the original height, which preserves the aspect ratio,
+    and the mesh is centered in the XY plane.
+    """
+    mesh = o3d.io.read_triangle_mesh(str(source))
+
+    if mesh.is_empty() or len(mesh.vertices) == 0:
+        raise ValueError("mesh contains no vertices")
+
+    vertices = np.asarray(mesh.vertices, dtype=np.float64)
+
+    if vertices.ndim != 2 or vertices.shape[1] != 3:
+        raise ValueError(f"expected vertices with shape (N, 3), got {vertices.shape}")
+    if not np.isfinite(vertices).all():
+        raise ValueError("mesh contains NaN or infinite coordinates")
+
+    vertices[:, 2] -= vertices[:, 2].min()
+    height = float(vertices[:, 2].max())
+
+    if height <= 1e-8:
+        raise ValueError("mesh height is zero")
+
+    vertices /= height
+    vertices[:, :2] -= vertices[:, :2].mean(axis=0)
+
+    mesh.vertices = o3d.utility.Vector3dVector(vertices)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+
+    if not o3d.io.write_triangle_mesh(str(destination), mesh):
+        raise OSError(f"failed to write {destination}")
+
+    extent = mesh.get_axis_aligned_bounding_box().get_extent()
+    return MeshExtent(
+        width=float(extent[0]),
+        depth=float(extent[1]),
+        height=float(extent[2]),
+    )
+
+
+def process_split(input_dir: Path, output_dir: Path) -> tuple[int, int]:
+    """Normalize every OFF file in a dataset split."""
+    if not input_dir.is_dir():
+        LOGGER.warning("Skipping missing directory: %s", input_dir)
+        return 0, 0
+
+    source_files = sorted(
+        path for path in input_dir.iterdir() if path.suffix.lower() == ".off"
+    )
+    if not source_files:
+        LOGGER.warning("No OFF files found in %s", input_dir)
+        return 0, 0
+
+    succeeded = 0
+    for source in tqdm(source_files, desc=f"Normalizing {input_dir.name}"):
+        destination = output_dir / source.name
+        try:
+            extent = normalize_mesh(source, destination)
+        except (OSError, RuntimeError, ValueError) as error:
+            LOGGER.warning("Could not process %s: %s", source.name, error)
+            continue
+
+        LOGGER.debug(
+            "%s: %.3f x %.3f x %.3f",
+            source.name,
+            extent.width,
+            extent.depth,
+            extent.height,
+        )
+        succeeded += 1
+
+    return succeeded, len(source_files)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Normalize ModelNet chair meshes to unit height."
+    )
+    parser.add_argument(
+        "--input-root",
+        type=Path,
+        default=PROJECT_ROOT / "data" / "raw",
+        help="Directory containing dataset split folders.",
+    )
+    parser.add_argument(
+        "--output-root",
+        type=Path,
+        default=PROJECT_ROOT / "data" / "normalized_off",
+        help="Directory for normalized OFF files.",
+    )
+    parser.add_argument(
+        "--splits",
+        nargs="+",
+        default=("train", "test"),
+        help="Dataset splits to process.",
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Print per-file dimensions.",
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(levelname)s: %(message)s",
+    )
+
+    total_succeeded = 0
+    total_files = 0
+
+    for split in args.splits:
+        succeeded, count = process_split(
+            args.input_root / split,
+            args.output_root / split,
+        )
+        total_succeeded += succeeded
+        total_files += count
+        LOGGER.info("%s: processed %d of %d files", split, succeeded, count)
+
+    if total_files == 0:
+        raise SystemExit("No input meshes were found.")
+
+    LOGGER.info("Finished: processed %d of %d files", total_succeeded, total_files)
+
 
 if __name__ == "__main__":
     main()

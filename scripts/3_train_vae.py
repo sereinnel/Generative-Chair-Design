@@ -1,206 +1,458 @@
-# 3_train_vae.py
-import os
-import time
-import random
+"""Train the PointNet-style VAE on normalized chair point clouds."""
+
+from __future__ import annotations
+
 import argparse
+import json
+import logging
+import random
+import time
+from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
-import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
-from torch.cuda.amp import autocast, GradScaler
+from scipy.spatial import cKDTree
+from torch import nn
+from torch.cuda.amp import GradScaler, autocast
+from torch.utils.data import DataLoader, Dataset
 
-from model_improved import PointNetVAE
+from model import PointNetVAE
 
-class Cfg:
-    DATA_DIR = "../data/normalized_npy"
-    TRAIN_SUBDIR = "train"
-    TEST_SUBDIR = "test"
+LOGGER = logging.getLogger(__name__)
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
-    RAW_POINTS = 16384
-    TRAIN_POINTS = 4096
-    LOSS_POINTS = 4096
 
-    BATCH_SIZE = 8
-    LR = 1e-4
-    WEIGHT_DECAY = 1e-5
-    LATENT_DIM = 256
-    EPOCHS = 25
-    MODEL_SAVE_DIR = "../models"
-    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-    NUM_WORKERS = 4
-    BETA = 1e-4      # коэффициент для KLD
-    GRAD_CLIP = 1.0
-    PRINT_EVERY = 20
+@dataclass
+class TrainingConfig:
+    """Hyperparameters and paths for the original experiment."""
 
-# -----------------------
-# Dataset
-# -----------------------
-class PointCloudDataset(Dataset):
-    def __init__(self, folder, num_points=Cfg.TRAIN_POINTS):
-        self.folder = folder
-        self.files = sorted(p for p in os.listdir(folder) if p.endswith(".npy"))
+    data_root: Path = PROJECT_ROOT / "data" / "normalized_npy"
+    train_subdir: str = "train"
+    validation_subdir: str = "test"
+    model_dir: Path = PROJECT_ROOT / "models"
+
+    output_points: int = 16_384
+    input_points: int = 4096
+    loss_points: int = 4096
+    latent_dim: int = 256
+
+    batch_size: int = 8
+    epochs: int = 23
+    learning_rate: float = 1e-4
+    weight_decay: float = 1e-5
+    beta: float = 1e-4
+    gradient_clip: float = 1.0
+
+    num_workers: int = 4
+    print_every: int = 20
+    validation_batches: int = 50
+    seed: int = 42
+    use_amp: bool = True
+
+
+class PointCloudDataset(Dataset[torch.Tensor]):
+    """Load NPY point clouds and sample a fixed number of input points."""
+
+    def __init__(self, directory: Path, num_points: int) -> None:
+        if not directory.is_dir():
+            raise FileNotFoundError(f"dataset directory not found: {directory}")
+
+        self.paths = sorted(directory.glob("*.npy"))
+        if not self.paths:
+            raise FileNotFoundError(f"no NPY files found in {directory}")
+
         self.num_points = num_points
 
-    def __len__(self):
-        return len(self.files)
+    def __len__(self) -> int:
+        return len(self.paths)
 
-    def __getitem__(self, idx):
-        path = os.path.join(self.folder, self.files[idx])
-        pts = np.load(path).astype(np.float32)  # (RAW_POINTS, 3)
-        # Если RAW_POINTS > num_points — случайная подвыборка без замены
-        if pts.shape[0] >= self.num_points:
-            idxs = np.random.choice(pts.shape[0], self.num_points, replace=False)
-        else:
-            idxs = np.random.choice(pts.shape[0], self.num_points, replace=True)
-        pts = pts[idxs, :]
-        # Normalize to zero mean on XY (optional): keep Z floor at 0 (already normalized)
-        return torch.from_numpy(pts)  # (num_points, 3)
+    def __getitem__(self, index: int) -> torch.Tensor:
+        points = np.load(self.paths[index]).astype(np.float32, copy=False)
 
-# -----------------------
-# Chamfer loss (GPU)
-# -----------------------
-def chamfer_loss_gpu(p1, p2):
-    # p1, p2: (B, N, 3)
-    # using torch.cdist
-    dists = torch.cdist(p1, p2)  # (B, N, N)
-    # for each point in p1 find nearest in p2
-    loss1 = torch.min(dists, dim=2)[0].mean()
-    # for each point in p2 find nearest in p1
-    loss2 = torch.min(dists, dim=1)[0].mean()
-    return loss1 + loss2
+        if points.ndim != 2 or points.shape[1] != 3:
+            raise ValueError(
+                f"{self.paths[index]} has shape {points.shape}; expected (N, 3)"
+            )
+        if not np.isfinite(points).all():
+            raise ValueError(f"{self.paths[index]} contains non-finite values")
 
-# -----------------------
-# Train / Eval
-# -----------------------
-def train_epoch(model, dataloader, optimizer, scaler, cfg, device):
+        replace = points.shape[0] < self.num_points
+        indices = np.random.choice(
+            points.shape[0],
+            size=self.num_points,
+            replace=replace,
+        )
+        return torch.from_numpy(points[indices])
+
+
+def set_seed(seed: int) -> None:
+    """Seed Python, NumPy and PyTorch."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def seed_worker(worker_id: int) -> None:
+    """Give each DataLoader worker a deterministic NumPy seed."""
+    del worker_id
+    worker_seed = torch.initial_seed() % (2**32)
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
+
+def sample_point_dimension(points: torch.Tensor, count: int) -> torch.Tensor:
+    """Select the same random point indices for every item in a batch."""
+    num_available = points.shape[1]
+
+    if num_available >= count:
+        indices = torch.randperm(num_available, device=points.device)[:count]
+    else:
+        indices = torch.randint(
+            num_available,
+            size=(count,),
+            device=points.device,
+        )
+
+    return points[:, indices, :]
+
+
+def bidirectional_chamfer_loss(
+    predicted: torch.Tensor,
+    target: torch.Tensor,
+) -> torch.Tensor:
+    """Return the sum of the two directed mean Chamfer distances.
+
+    This matches the reconstruction objective used in the original run.
+    Distances are Euclidean rather than squared Euclidean distances.
+    """
+    distances = torch.cdist(predicted, target)
+    predicted_to_target = distances.amin(dim=2).mean()
+    target_to_predicted = distances.amin(dim=1).mean()
+    return predicted_to_target + target_to_predicted
+
+
+def kl_divergence(
+    mean: torch.Tensor,
+    log_variance: torch.Tensor,
+) -> torch.Tensor:
+    """Return the batch-mean KL divergence from the unit Gaussian."""
+    per_sample = -0.5 * torch.sum(
+        1 + log_variance - mean.square() - log_variance.exp(),
+        dim=1,
+    )
+    return per_sample.mean()
+
+
+def train_epoch(
+    model: PointNetVAE,
+    dataloader: DataLoader[torch.Tensor],
+    optimizer: torch.optim.Optimizer,
+    scaler: GradScaler,
+    config: TrainingConfig,
+    device: torch.device,
+) -> float:
+    """Run one training epoch and return the mean total loss."""
     model.train()
     total_loss = 0.0
-    for i, batch in enumerate(dataloader):
-        # batch: (B, N, 3) -> transpose for encoder: (B, 3, N)
-        batch = batch.to(device)  # (B, N, 3)
-        batch_t = batch.permute(0, 2, 1).contiguous()
+    total_items = 0
+    amp_enabled = config.use_amp and device.type == "cuda"
 
-        optimizer.zero_grad()
-        with autocast():
-            recon, mu, logvar = model(batch_t)
-            # recon: (B, RAW_POINTS, 3) — возможно генерируем больше точек than input
-            # Для loss: подвыборка LOSS_POINTS from both recon and batch
-            B = batch.shape[0]
-            N_recon = recon.shape[1]
-            N_gt = batch.shape[1]
-            # Подвыборка индексов
-            idx_recon = torch.randperm(N_recon, device=device)[:cfg.LOSS_POINTS]
-            idx_gt = torch.randperm(N_gt, device=device)[:cfg.LOSS_POINTS]
-            recon_sub = recon[:, idx_recon, :]
-            gt_sub = batch[:, idx_gt, :]
+    for step, batch in enumerate(dataloader, start=1):
+        target = batch.to(device, non_blocking=True)
+        encoder_input = target.transpose(1, 2).contiguous()
 
-            cd = chamfer_loss_gpu(recon_sub, gt_sub)
-            kld = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1).mean()
-            loss = cd + cfg.BETA * kld
+        optimizer.zero_grad(set_to_none=True)
+
+        with autocast(enabled=amp_enabled):
+            reconstruction, mean, log_variance = model(encoder_input)
+            reconstruction_subset = sample_point_dimension(
+                reconstruction,
+                config.loss_points,
+            )
+            target_subset = sample_point_dimension(target, config.loss_points)
+
+            reconstruction_loss = bidirectional_chamfer_loss(
+                reconstruction_subset,
+                target_subset,
+            )
+            latent_loss = kl_divergence(mean, log_variance)
+            loss = reconstruction_loss + config.beta * latent_loss
 
         scaler.scale(loss).backward()
-        # gradient clipping
         scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.GRAD_CLIP)
+        nn.utils.clip_grad_norm_(model.parameters(), config.gradient_clip)
         scaler.step(optimizer)
         scaler.update()
 
-        total_loss += loss.item() * B
+        batch_size = target.shape[0]
+        total_loss += float(loss.item()) * batch_size
+        total_items += batch_size
 
-        if (i + 1) % cfg.PRINT_EVERY == 0:
-            avg_loss = total_loss / ( (i+1) * dataloader.batch_size )
-            print(f"[train] iter {i+1}/{len(dataloader)} avg_loss: {avg_loss:.6f}")
+        if step % config.print_every == 0:
+            LOGGER.info(
+                "step %d/%d, mean loss %.6f",
+                step,
+                len(dataloader),
+                total_loss / total_items,
+            )
 
-    return total_loss / len(dataloader.dataset)
+    return total_loss / total_items
 
-def evaluate(model, dataloader, cfg, device, max_batches=50):
+
+def symmetric_chamfer_l2(
+    first: np.ndarray,
+    second: np.ndarray,
+) -> float:
+    """Average the two directed mean nearest-neighbor distances."""
+    first_tree = cKDTree(first)
+    second_tree = cKDTree(second)
+    first_to_second = second_tree.query(first, k=1)[0].mean()
+    second_to_first = first_tree.query(second, k=1)[0].mean()
+    return 0.5 * float(first_to_second + second_to_first)
+
+
+@torch.inference_mode()
+def evaluate_reconstruction(
+    model: PointNetVAE,
+    dataloader: DataLoader[torch.Tensor],
+    config: TrainingConfig,
+    device: torch.device,
+) -> tuple[float, float]:
+    """Measure reconstruction Chamfer-L2 on the validation split."""
     model.eval()
-    cds = []
-    with torch.no_grad():
-        for i, batch in enumerate(dataloader):
-            if i >= max_batches:
-                break
-            batch = batch.to(device)
-            batch_t = batch.permute(0, 2, 1).contiguous()
-            recon, mu, logvar = model(batch_t)
-            # Compute chamfer on LOSS_POINTS (subsample)
-            N_recon = recon.shape[1]
-            N_gt = batch.shape[1]
-            idx_recon = torch.randperm(N_recon, device=device)[:cfg.LOSS_POINTS]
-            idx_gt = torch.randperm(N_gt, device=device)[:cfg.LOSS_POINTS]
-            recon_sub = recon[:, idx_recon, :].cpu().numpy()
-            gt_sub = batch[:, idx_gt, :].cpu().numpy()
-            # Convert to numpy and compute per-sample cd with KDTree
-            from scipy.spatial import cKDTree
-            for b in range(recon_sub.shape[0]):
-                tree1 = cKDTree(recon_sub[b])
-                tree2 = cKDTree(gt_sub[b])
-                d1, _ = tree1.query(gt_sub[b])
-                d2, _ = tree2.query(recon_sub[b])
-                cds.append(d1.mean() + d2.mean())
-    import numpy as np
-    return float(np.mean(cds)), float(np.std(cds))
+    values: list[float] = []
 
-# -----------------------
-# Main
-# -----------------------
-def main(args):
-    cfg = Cfg
-    # apply CLI overrides
-    if args.epochs: cfg.EPOCHS = args.epochs
-    if args.batch_size: cfg.BATCH_SIZE = args.batch_size
-    if args.latent_dim: cfg.LATENT_DIM = args.latent_dim
-    if args.train_points: cfg.TRAIN_POINTS = args.train_points
-    if args.loss_points: cfg.LOSS_POINTS = args.loss_points
+    for batch_index, batch in enumerate(dataloader):
+        if batch_index >= config.validation_batches:
+            break
 
-    device = torch.device(cfg.DEVICE)
-    print("Device:", device)
+        target = batch.to(device, non_blocking=True)
+        encoder_input = target.transpose(1, 2).contiguous()
+        reconstruction, _, _ = model(encoder_input)
 
-    train_folder = os.path.join(os.path.dirname(__file__), cfg.DATA_DIR, cfg.TRAIN_SUBDIR)
-    test_folder = os.path.join(os.path.dirname(__file__), cfg.DATA_DIR, cfg.TEST_SUBDIR)
-    os.makedirs(os.path.join(os.path.dirname(__file__), cfg.MODEL_SAVE_DIR), exist_ok=True)
+        reconstruction_subset = sample_point_dimension(
+            reconstruction,
+            config.loss_points,
+        ).cpu().numpy()
+        target_subset = sample_point_dimension(
+            target,
+            config.loss_points,
+        ).cpu().numpy()
 
-    train_ds = PointCloudDataset(train_folder, num_points=cfg.TRAIN_POINTS)
-    test_ds = PointCloudDataset(test_folder, num_points=cfg.TRAIN_POINTS)
+        for predicted, reference in zip(reconstruction_subset, target_subset):
+            values.append(symmetric_chamfer_l2(predicted, reference))
 
-    train_loader = DataLoader(train_ds, batch_size=cfg.BATCH_SIZE, shuffle=True, num_workers=cfg.NUM_WORKERS, pin_memory=True)
-    test_loader = DataLoader(test_ds, batch_size=cfg.BATCH_SIZE, shuffle=False, num_workers=cfg.NUM_WORKERS, pin_memory=True)
+    if not values:
+        raise RuntimeError("validation produced no measurements")
 
-    model = PointNetVAE(num_points=cfg.RAW_POINTS, latent_dim=cfg.LATENT_DIM).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=cfg.LR, weight_decay=cfg.WEIGHT_DECAY)
-    scaler = GradScaler()
+    return float(np.mean(values)), float(np.std(values))
 
-    best_cd = float('inf')
-    for epoch in range(1, cfg.EPOCHS + 1):
-        t0 = time.time()
-        train_loss = train_epoch(model, train_loader, optimizer, scaler, cfg, device)
-        cd_mean, cd_std = evaluate(model, test_loader, cfg, device, max_batches=50)
 
-        t1 = time.time()
-        print(f"Epoch {epoch}/{cfg.EPOCHS} | train_loss: {train_loss:.6f} | cd_mean: {cd_mean:.6f} ± {cd_std:.6f} | time: {(t1-t0):.1f}s")
+def checkpoint_payload(
+    epoch: int,
+    model: PointNetVAE,
+    optimizer: torch.optim.Optimizer,
+    validation_chamfer: float,
+    config: TrainingConfig,
+) -> dict[str, Any]:
+    """Build a restartable training checkpoint."""
+    serializable_config = asdict(config)
+    serializable_config["data_root"] = str(config.data_root)
+    serializable_config["model_dir"] = str(config.model_dir)
 
-        # checkpoint
-        save_path = os.path.join(os.path.dirname(__file__), cfg.MODEL_SAVE_DIR, f"vae_epoch_{epoch:03d}.pth")
-        torch.save({
-            'epoch': epoch,
-            'model_state': model.state_dict(),
-            'optimizer_state': optimizer.state_dict(),
-        }, save_path)
+    return {
+        "epoch": epoch,
+        "model_state": model.state_dict(),
+        "optimizer_state": optimizer.state_dict(),
+        "validation_chamfer_l2": validation_chamfer,
+        "config": serializable_config,
+    }
 
-        # keep best
-        if cd_mean < best_cd:
-            best_cd = cd_mean
-            torch.save(model.state_dict(), os.path.join(os.path.dirname(__file__), cfg.MODEL_SAVE_DIR, "model_improved_best.pth"))
-            print("  ✅ New best model saved (best cd = {:.6f})".format(best_cd))
+
+def train(config: TrainingConfig) -> None:
+    """Train the model and save the best and latest checkpoints."""
+    set_seed(config.seed)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    LOGGER.info("Using device: %s", device)
+
+    train_dataset = PointCloudDataset(
+        config.data_root / config.train_subdir,
+        config.input_points,
+    )
+    validation_dataset = PointCloudDataset(
+        config.data_root / config.validation_subdir,
+        config.input_points,
+    )
+
+    generator = torch.Generator()
+    generator.manual_seed(config.seed)
+
+    loader_options = {
+        "batch_size": config.batch_size,
+        "num_workers": config.num_workers,
+        "pin_memory": device.type == "cuda",
+        "worker_init_fn": seed_worker,
+        "generator": generator,
+        "persistent_workers": config.num_workers > 0,
+    }
+
+    train_loader = DataLoader(
+        train_dataset,
+        shuffle=True,
+        **loader_options,
+    )
+    validation_loader = DataLoader(
+        validation_dataset,
+        shuffle=False,
+        **loader_options,
+    )
+
+    model = PointNetVAE(
+        num_points=config.output_points,
+        latent_dim=config.latent_dim,
+    ).to(device)
+
+    parameter_count = sum(parameter.numel() for parameter in model.parameters())
+    LOGGER.info("Model parameters: %.1f million", parameter_count / 1e6)
+
+    optimizer = torch.optim.Adam(
+        model.parameters(),
+        lr=config.learning_rate,
+        weight_decay=config.weight_decay,
+    )
+    scaler = GradScaler(enabled=config.use_amp and device.type == "cuda")
+
+    config.model_dir.mkdir(parents=True, exist_ok=True)
+    (config.model_dir / "training_config.json").write_text(
+        json.dumps(
+            {
+                **asdict(config),
+                "data_root": str(config.data_root),
+                "model_dir": str(config.model_dir),
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    best_chamfer = float("inf")
+    best_path = config.model_dir / "pointnet_vae_best.pth"
+    latest_path = config.model_dir / "pointnet_vae_latest.pth"
+
+    for epoch in range(1, config.epochs + 1):
+        started_at = time.perf_counter()
+
+        train_loss = train_epoch(
+            model,
+            train_loader,
+            optimizer,
+            scaler,
+            config,
+            device,
+        )
+        validation_mean, validation_std = evaluate_reconstruction(
+            model,
+            validation_loader,
+            config,
+            device,
+        )
+
+        elapsed = time.perf_counter() - started_at
+        LOGGER.info(
+            "epoch %d/%d | train loss %.6f | validation Chamfer-L2 "
+            "%.6f +/- %.6f | %.1f s",
+            epoch,
+            config.epochs,
+            train_loss,
+            validation_mean,
+            validation_std,
+            elapsed,
+        )
+
+        payload = checkpoint_payload(
+            epoch,
+            model,
+            optimizer,
+            validation_mean,
+            config,
+        )
+        torch.save(payload, latest_path)
+
+        if validation_mean < best_chamfer:
+            best_chamfer = validation_mean
+            torch.save(model.state_dict(), best_path)
+            LOGGER.info(
+                "Saved new best model at epoch %d (Chamfer-L2 %.6f)",
+                epoch,
+                best_chamfer,
+            )
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--data-root", type=Path)
+    parser.add_argument("--model-dir", type=Path)
+    parser.add_argument("--epochs", type=int)
+    parser.add_argument("--batch-size", type=int)
+    parser.add_argument("--latent-dim", type=int)
+    parser.add_argument("--input-points", type=int)
+    parser.add_argument("--loss-points", type=int)
+    parser.add_argument("--num-workers", type=int)
+    parser.add_argument("--seed", type=int)
+    parser.add_argument(
+        "--disable-amp",
+        action="store_true",
+        help="Disable automatic mixed precision.",
+    )
+    return parser.parse_args()
+
+
+def config_from_args(args: argparse.Namespace) -> TrainingConfig:
+    config = TrainingConfig()
+
+    overrides = {
+        "data_root": args.data_root,
+        "model_dir": args.model_dir,
+        "epochs": args.epochs,
+        "batch_size": args.batch_size,
+        "latent_dim": args.latent_dim,
+        "input_points": args.input_points,
+        "loss_points": args.loss_points,
+        "num_workers": args.num_workers,
+        "seed": args.seed,
+    }
+
+    for field, value in overrides.items():
+        if value is not None:
+            setattr(config, field, value)
+
+    if args.disable_amp:
+        config.use_amp = False
+
+    positive_fields = (
+        "epochs",
+        "batch_size",
+        "latent_dim",
+        "input_points",
+        "loss_points",
+    )
+    for field in positive_fields:
+        if getattr(config, field) <= 0:
+            raise ValueError(f"{field} must be positive")
+
+    return config
+
+
+def main() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+    train(config_from_args(parse_args()))
+
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--epochs', type=int, default=None)
-    parser.add_argument('--batch_size', type=int, default=None)
-    parser.add_argument('--latent_dim', type=int, default=None)
-    parser.add_argument('--train_points', type=int, default=None)
-    parser.add_argument('--loss_points', type=int, default=None)
-    args = parser.parse_args()
-    main(args)
+    main()
