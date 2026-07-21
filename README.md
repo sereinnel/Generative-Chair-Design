@@ -36,10 +36,12 @@ uneven and thin elements are poorly represented.*
 - Optimizer: Adam
 - Learning rate: `1e-4`
 - KL coefficient: `1e-4`
+- Training duration: 25 epochs
 - Selected checkpoint: epoch 23
 
-The checkpoint from epoch 23 was used because validation Chamfer
-Distance stopped improving afterwards.
+Training continued for 25 epochs, but the checkpoint from epoch 23
+was selected because validation Chamfer Distance deteriorated during
+the final two epochs.
 
 ## Preliminary evaluation
 
